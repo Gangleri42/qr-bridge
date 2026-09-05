@@ -12,8 +12,8 @@ extern "C" {
 #endif
 
 // Longest code the scanner may type before Enter. A longer one is
-// discarded whole.
-#define SCANNER_MAX_TEXT 4096
+// discarded whole. The largest QR code holds 4296 characters.
+#define SCANNER_MAX_TEXT 8192
 
 // One decoded code: the characters the scanner typed before Enter.
 typedef struct {

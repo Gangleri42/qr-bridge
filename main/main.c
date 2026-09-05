@@ -1,5 +1,6 @@
 // main.c -- scan a QR code with the USB scanner, hold it in RAM and
-// present it to the SeedHammer as an NFC Forum Type 2 tag.
+// present it to the SeedHammer as an NFC Forum Type 2 tag, or as a
+// series of them when it does not fit one.
 
 #include <string.h>
 
@@ -8,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "bbqr.h"
 #include "pn532.h"
 #include "scanner.h"
 #include "tag_emu.h"
@@ -17,6 +19,10 @@ static const char *TAG = "main";
 
 // Longest scan the virtual tag can carry as a text record.
 #define MAX_TEXT (TAG_EMU_MAX_NDEF - TEXT_RECORD_OVERHEAD)
+// Base32 characters a BBQr part carries at that capacity, and the
+// parts the longest scan takes.
+#define PART_CHARS ((MAX_TEXT - BBQR_HEADER_LEN) / 8 * 8)
+#define MAX_PARTS ((BBQR_BASE32_LEN(SCANNER_MAX_TEXT) + PART_CHARS - 1) / PART_CHARS)
 
 // How long to wait for a reader between looks at the scanner.
 #define LISTEN_SLICE_MS 200
@@ -25,6 +31,22 @@ static const char *TAG = "main";
 // within a few milliseconds, and answering it lets the reader end the
 // record cleanly instead of timing out.
 #define STRAGGLER_MS 50
+// The reader takes one part per session and is back for the next
+// about a second later. Once every part has been read, this much
+// silence means it left with the whole series.
+#define SERIES_IDLE_MS 3000
+
+// The armed payload. A scan that fits the tag is one text record and
+// parts stays 0; a longer one becomes a BBQr series, one part per tag,
+// presented in turn.
+static struct {
+    char encoded[BBQR_BASE32_LEN(SCANNER_MAX_TEXT)];
+    bbqr_series_t series;
+    size_t parts;
+    size_t next;           // Part to present next.
+    bool read[MAX_PARTS];  // Parts read at least once.
+    size_t unread;
+} payload;
 
 // Serve one Type 2 command from the reader. READ (0x30) gets the four
 // blocks from the requested one; anything else is ignored and the
@@ -42,34 +64,76 @@ static bool serve_command(const uint8_t *cmd, size_t len) {
 // until it has the whole message or walks away. Returns true once the
 // whole message was read.
 static bool serve_session(uint8_t *cmd, size_t max, size_t first) {
+    int reads = 0;
     if (!serve_command(cmd, first)) {
+        ESP_LOGW(TAG, "reader left at its first command");
         return false;
     }
     for (;;) {
         int r = pn532_tg_get_command(cmd, max, tag_emu_delivered() ? STRAGGLER_MS : 500);
-        if (r < 0 || !serve_command(cmd, (size_t)r)) {
+        if (r < 0) {
             break;  // Reader gone, or done with the tag.
         }
+        reads++;
+        if (!serve_command(cmd, (size_t)r)) {
+            break;
+        }
+    }
+    if (!tag_emu_delivered()) {
+        ESP_LOGW(TAG, "reader left after %d reads", reads);
     }
     return tag_emu_delivered();
 }
 
-// Turn a scan into the virtual tag. Returns false if it does not fit.
+// Load text into the virtual tag as one text record.
+static bool load_text(const uint8_t *text, size_t len) {
+    static uint8_t ndef[TAG_EMU_MAX_NDEF];
+    size_t n = text_record_build(text, len, ndef, sizeof(ndef));
+    return n != 0 && tag_emu_load(ndef, n);
+}
+
+// Load the series part due next into the virtual tag.
+static bool present(void) {
+    static char part[MAX_TEXT];
+    size_t n = bbqr_part(&payload.series, payload.next, part);
+    return load_text((const uint8_t *)part, n);
+}
+
+// Turn a scan into the virtual tag, or into a series of them when it
+// does not fit one. Returns false if it cannot be carried.
 static bool arm(const scan_t *scan) {
-    static uint8_t ndef[SCANNER_MAX_TEXT + TEXT_RECORD_OVERHEAD];
-    size_t len = text_record_build(scan->text, scan->len, ndef, sizeof(ndef));
-    if (len == 0 || !tag_emu_load(ndef, len)) {
-        ESP_LOGE(TAG, "scan of %zu bytes does not fit the tag (%d at most)", scan->len, MAX_TEXT);
+    if (scan->len <= MAX_TEXT) {
+        payload.parts = 0;
+        if (!load_text(scan->text, scan->len)) {
+            ESP_LOGE(TAG, "scan of %zu bytes does not fit the tag", scan->len);
+            return false;
+        }
+        ESP_LOGI(TAG, "armed: %zu bytes", scan->len);
+        return true;
+    }
+    size_t len = bbqr_base32(scan->text, scan->len, payload.encoded);
+    if (!bbqr_split(&payload.series, payload.encoded, len, 'U', MAX_TEXT) ||
+        payload.series.parts > MAX_PARTS) {
+        ESP_LOGE(TAG, "scan of %zu bytes does not fit %d parts", scan->len, MAX_PARTS);
         return false;
     }
-    ESP_LOGI(TAG, "armed: %zu bytes, NDEF %zu bytes", scan->len, len);
+    payload.parts = payload.series.parts;
+    payload.next = 0;
+    memset(payload.read, 0, sizeof(payload.read));
+    payload.unread = payload.parts;
+    if (!present()) {
+        ESP_LOGE(TAG, "part does not fit the tag");
+        return false;
+    }
+    ESP_LOGI(TAG, "armed: %zu bytes as %zu parts", scan->len, payload.parts);
     return true;
 }
 
 // Waits for scans and presents the latest one as a tag until the
 // reader has taken it. The chip listens for a reader in one go; the
 // task looks at the scanner between slices of that wait, and a new
-// scan replaces the tag on the spot.
+// scan replaces the tag on the spot. A series cycles through its parts
+// for as long as the reader keeps coming back.
 static void nfc_task(void *arg) {
     if (!pn532_start()) {
         ESP_LOGE(TAG, "PN532 does not answer; retrying every second");
@@ -85,6 +149,7 @@ static void nfc_task(void *arg) {
     uint8_t cmd[64];
     bool armed = false;
     bool listening = false;
+    TickType_t last_read = 0;
     for (;;) {
         if (scanner_take(&scan, armed ? 0 : portMAX_DELAY)) {
             if (listening) {
@@ -106,15 +171,49 @@ static void nfc_task(void *arg) {
         }
         int n = pn532_tg_wait_initiator(cmd, sizeof(cmd), LISTEN_SLICE_MS);
         if (n == PN532_TIMEOUT) {
-            continue;  // Nobody tapped yet.
+            // Nobody tapped in this slice.
+            if (payload.parts > 0 && payload.unread == 0) {
+                // Every part has been read: the series is done once the
+                // reader stays away for the idle window.
+                if (xTaskGetTickCount() - last_read > pdMS_TO_TICKS(SERIES_IDLE_MS)) {
+                    ESP_LOGI(TAG, "delivered: %zu parts", payload.parts);
+                    pn532_abort();
+                    listening = false;
+                    armed = false;
+                }
+            } else if (payload.parts > 0) {
+                // Parts still unread. A single target arm can be issued
+                // while the reader's field is mid-poll and then never
+                // activate; with no byte to end the slice the wait would
+                // run forever. Drop the arm and re-arm so the reader's
+                // next field cycle activates the tag for the pending part.
+                pn532_abort();
+                listening = false;
+            }
+            continue;
         }
         listening = false;
         if (n < 0) {
             continue;  // Present the tag again.
         }
         ESP_LOGI(TAG, "reader activated the tag");
-        if (serve_session(cmd, sizeof(cmd), (size_t)n)) {
+        if (!serve_session(cmd, sizeof(cmd), (size_t)n)) {
+            continue;  // Reader left early; present the tag again.
+        }
+        if (payload.parts == 0) {
             ESP_LOGI(TAG, "delivered");
+            armed = false;
+            continue;
+        }
+        if (!payload.read[payload.next]) {
+            payload.read[payload.next] = true;
+            payload.unread--;
+        }
+        last_read = xTaskGetTickCount();
+        ESP_LOGI(TAG, "part %zu of %zu read", payload.next + 1, payload.parts);
+        payload.next = (payload.next + 1) % payload.parts;
+        if (!present()) {
+            ESP_LOGE(TAG, "part does not fit the tag");
             armed = false;
         }
     }

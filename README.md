@@ -5,9 +5,11 @@ A USB barcode scanner on one side, an emulated NFC tag on the other.
 Scan a QR code (a wallet descriptor, BIP-39 words, a text note) with the
 scanner. The bridge holds the decoded text in RAM and presents it to the
 SeedHammer as an NTAG-shaped NFC Forum Type 2 tag carrying one NDEF Text
-record. Hold the SeedHammer's reader against the PN532 antenna the way
-you would tap a sticker, and the SeedHammer takes it from there. No
-screen, no storage, no radio silicon.
+record. A scan too long for one tag goes out as a series of tags
+carrying BBQr parts, which the SeedHammer joins. Hold the SeedHammer's
+reader against the PN532 antenna the way you would tap a sticker, and
+the SeedHammer takes it from there. No screen, no storage, no radio
+silicon.
 
 ## Hardware
 
@@ -56,30 +58,44 @@ build paths inside.
    again replaces the payload.
 3. Tap: while a payload is armed the PN532 sits in target mode as a
    Type 2 tag. The SeedHammer reads it block by block; once it has read
-   the block holding the NDEF terminator the payload counts as
+   the block holding the last message byte the payload counts as
    delivered and is cleared. The SeedHammer's preview screen is the
    confirmation.
+4. A long scan is a series. As soon as the SeedHammer has read one
+   part the bridge presents the next, round-robin, and the SeedHammer
+   counts PART n OF m on its screen; keep holding until the preview
+   appears, about PER_PART s per part. The series is cleared once every
+   part has been read and the reader has stayed away for 3 s. Pulled
+   away early, the bridge keeps the series armed and the next tap
+   resumes it.
 
 Limits:
 
-- 977 bytes of scanned text. The virtual tag is 252 blocks, a little
-  above an NTAG216, and a long multisig descriptor fits.
+- 977 bytes of scanned text per tag. The virtual tag is 252 blocks, a
+  little above an NTAG216, and the SeedHammer's reader addresses no
+  more. Longer scans go as BBQr parts of 605 bytes each: a 2.8 KB
+  descriptor takes five tags and about TOTAL_5 s under the reader. The
+  SeedHammer joins series of up to 16 KB.
 - Keyboard-mode scanners carry printable ASCII only, and the keymap is
-  the US layout. Scans over 4096 characters are discarded whole.
-- The payload is one text record. The SeedHammer decides what it is:
-  seed words, a SeedQR in its digit form, a descriptor, codex32, nip19,
-  or a plain text plate.
+  the US layout. Scans over 8192 characters are discarded whole; the
+  largest QR code holds 4296.
+- The payload is one text record, joined from its parts first when it
+  came as a series. The SeedHammer decides what it is: seed words, a
+  SeedQR in its digit form, a descriptor, codex32, nip19, or a plain
+  text plate.
 
 ## Console
 
 UART0 logs state changes and byte counts: scanner connected, scan of N
-bytes, armed, reader activated, delivered. The scanned text itself is
-never logged.
+bytes, armed, reader activated, part 2 of 5 read, delivered. The
+scanned text itself is never logged.
 
 ## Tests
 
-The two pure components, the Text record and the virtual tag, build on
-the host with the checks that pin their byte layouts:
+The three pure components, the Text record, the virtual tag and the
+BBQr splitter, build on the host with the checks that pin their byte
+layouts; the splitter is checked byte for byte against parts made by
+the SeedHammer's own:
 
 ```sh
 make -C test/host run
@@ -96,7 +112,8 @@ hardware.
 - `components/pn532/` PN532 HSU driver, target mode only.
 - `components/tag_emu/` the virtual Type 2 tag: CC, NDEF TLV, block reads.
 - `components/text_record/` one NDEF Text record.
-- `test/host/` host build and tests for the two components above.
+- `components/bbqr/` BBQr parts for a scan that does not fit one tag.
+- `test/host/` host build and tests for the three components above.
 
 ## License
 
