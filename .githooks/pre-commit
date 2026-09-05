@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# pre-commit: the mechanical house rules, checked on staged content.
+#
+#   1. No TODO / XXX / FIXME markers in added lines. File an issue or
+#      fix it now.
+#   2. No em-dash in added lines. Comments and prose state the
+#      constraint with plain punctuation.
+#
+# Only added lines are inspected, so the hook never fails on text this
+# commit did not touch. The hooks themselves are exempt: this file has
+# to name the markers it rejects. Bypass with `git commit --no-verify` only when
+# the violation is the repo owner's conscious decision.
+set -uo pipefail
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+fail=0
+
+if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Added lines of the staged diff, prefixed "file:lineno:".
+added_lines() {
+  git diff --cached --diff-filter=AM --no-color -U0 -- . ':!dependencies.lock' ':!.githooks' \
+    | awk '
+      /^\+\+\+ b\// { file=substr($0,7); next }
+      /^@@/ {
+        n = split($3, a, ",")
+        sub(/^\+/, "", a[1])
+        lineno = a[1] + 0
+        next
+      }
+      /^\+/ && !/^\+\+\+/ {
+        print file ":" lineno ":" substr($0,2)
+        lineno++
+        next
+      }
+      /^[^-]/ { lineno++ }
+    '
+}
+
+todo_hits="$(added_lines | grep -E '(^|[^A-Za-z_])(TODO|XXX|FIXME)([^A-Za-z_]|$)' || true)"
+if [ -n "$todo_hits" ]; then
+  red "pre-commit: TODO/XXX/FIXME markers are not used in this repo:"
+  echo "$todo_hits" | sed 's/^/  /'
+  fail=1
+fi
+
+emdash=$'\xe2\x80\x94'
+dash_hits="$(added_lines | grep -F "$emdash" || true)"
+if [ -n "$dash_hits" ]; then
+  red "pre-commit: em-dashes are not used in this repo:"
+  echo "$dash_hits" | sed 's/^/  /'
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  yellow "pre-commit: blocked. Rerun with --no-verify only as a conscious override."
+  exit 1
+fi
+exit 0
