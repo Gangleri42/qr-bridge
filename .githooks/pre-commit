@@ -5,6 +5,7 @@
 #      fix it now.
 #   2. No em-dash in added lines. Comments and prose state the
 #      constraint with plain punctuation.
+#   3. The host tests pass when components/ or test/ changed.
 #
 # Only added lines are inspected, so the hook never fails on text this
 # commit did not touch. The hooks themselves are exempt: this file has
@@ -53,6 +54,14 @@ if [ -n "$dash_hits" ]; then
   red "pre-commit: em-dashes are not used in this repo:"
   echo "$dash_hits" | sed 's/^/  /'
   fail=1
+fi
+
+# 3. The host tests, when a component or the tests changed.
+if git diff --cached --name-only | grep -qE '^(components/|test/)'; then
+  if ! make -s -C test/host run >/dev/null; then
+    red "pre-commit: the host tests fail (make -C test/host run)."
+    fail=1
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

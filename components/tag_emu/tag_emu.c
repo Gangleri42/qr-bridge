@@ -5,10 +5,11 @@
 // way it scans a sticker, so nothing on the SeedHammer side has to
 // enter card-emulation mode.
 //
-// Layout mirrors what the SeedHammer's nfc/type2 reader expects:
-//   block 3: CC = E1 10 <size> 00   (size in 8-byte units)
-//   blocks 4+: NDEF TLV: 03 [FF hi lo] <ndef> FE, padded to 4-byte
-//   blocks.
+// Memory layout, as the SeedHammer's Type 2 reader expects it:
+//   blocks 0-2: UID, BCC and lock bytes
+//   block 3:    CC = E1 10 <size> 00   (size in 8-byte units)
+//   blocks 4+:  NDEF TLV 03 [len | FF hi lo] <ndef> FE, padded to
+//               whole blocks
 // Anti-collision (REQA/ATQA, UID, SAK) is handled by the PN532's
 // target-mode hardware; only READ commands reach this layer.
 
@@ -17,91 +18,85 @@
 #include <string.h>
 
 #define BLOCK_SIZE 4
+#define READ_SIZE 16
 
-// Virtual tag size in blocks. NTAG216 tops out at 888 user bytes; the
-// CC advertises a little more so a long descriptor fits (977 payload
-// bytes after the Text record and TLV overhead).
-#define MAX_BLOCKS 252
+// A single-size UID. 0x08 in the first byte marks it as random per
+// ISO 14443-3, so no reader expects a manufacturer code.
+static const uint8_t uid[4] = {0x08, 0x11, 0x22, 0x33};
 
-static uint8_t vmem[MAX_BLOCKS * BLOCK_SIZE];
-static size_t vmem_len;          // Bytes in use, a whole number of blocks.
-static size_t tlv_end_block;     // Block holding the TLV terminator.
+static uint8_t vmem[TAG_EMU_BLOCKS * BLOCK_SIZE];
+static size_t vmem_len;       // Bytes in use, a whole number of blocks.
+static size_t last_block;     // Block holding the last message byte.
 static bool delivered;
 
+void tag_emu_nfca(uint8_t out[6]) {
+    out[0] = 0x44;  // SENS_RES: single-size UID, bit-frame anticollision.
+    out[1] = 0x00;
+    out[2] = uid[1];
+    out[3] = uid[2];
+    out[4] = uid[3];
+    out[5] = 0x00;  // SEL_RES: no ISO-DEP, a plain Type 2 tag.
+}
+
 bool tag_emu_load(const uint8_t *ndef, size_t ndef_len) {
-    // TLV header: 03 len for short messages, 03 FF hi lo above 254.
+    if (ndef_len > TAG_EMU_MAX_NDEF) {
+        return false;
+    }
+    // TLV header: 03 len up to 254 bytes, 03 FF hi lo above.
     size_t hdr = ndef_len < 255 ? 2 : 4;
-    size_t tlv_bytes = hdr + ndef_len + 1;  // + terminator FE.
+    size_t tlv_bytes = hdr + ndef_len + 1;  // Plus the terminator.
     size_t data_blocks = (tlv_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    // Blocks 4 .. 4+data_blocks-1 hold the TLV; the reader stops at
-    // memBlocks = cc[2]*8/4 = cc[2]*2, which must reach the last block.
     size_t mem_blocks = 4 + data_blocks;
-    if (mem_blocks > MAX_BLOCKS) {
-        return false;
-    }
-    size_t cc_size = (mem_blocks + 1) / 2;  // 8-byte units, rounded up.
+    // The reader stops at cc[2] * 8 bytes, which must reach the last
+    // block: round up to whole 8-byte units.
+    size_t cc_size = (mem_blocks + 1) / 2;
     size_t total = mem_blocks * BLOCK_SIZE;
-    if (total > sizeof(vmem)) {
-        return false;
-    }
 
     memset(vmem, 0, total);
-    // UID pages: block 0 carries the 4-byte UID the PN532 presents in
-    // anti-collision (08 11 22 33), block 1 the lock/OTP area. Readers
-    // that check the read-back UID against anti-collision need this.
-    vmem[0] = 0x08; vmem[1] = 0x11; vmem[2] = 0x22; vmem[3] = 0x33;
-    vmem[4] = 0x00; vmem[5] = 0x00; vmem[6] = 0x00;
-    vmem[7] = (uint8_t)(0x08 ^ 0x11 ^ 0x22 ^ 0x33);  // BCC0.
-    vmem[8] = 0x00; vmem[9] = 0x00; vmem[10] = 0x00;
-    vmem[11] = (uint8_t)(0x08 ^ 0x11 ^ 0x22 ^ 0x33); // BCC1.
-    // Capability container at block 3.
-    vmem[12] = 0xe1;            // Magic.
-    vmem[13] = 0x10;            // Version.
+    uint8_t bcc = uid[0] ^ uid[1] ^ uid[2] ^ uid[3];
+    memcpy(&vmem[0], uid, sizeof(uid));
+    vmem[7] = bcc;
+    vmem[11] = bcc;
+    vmem[12] = 0xe1;  // CC magic.
+    vmem[13] = 0x10;  // Type 2 mapping version 1.0.
     vmem[14] = (uint8_t)cc_size;
-    vmem[15] = 0x00;
+    vmem[15] = 0x00;  // Read and write allowed.
 
-    // NDEF TLV starting at block 4 (offset 16).
     size_t off = 16;
-    vmem[off++] = 0x03;         // NDEF TLV type.
+    vmem[off++] = 0x03;  // NDEF message TLV.
     if (ndef_len < 255) {
         vmem[off++] = (uint8_t)ndef_len;
     } else {
         vmem[off++] = 0xff;
         vmem[off++] = (uint8_t)(ndef_len >> 8);
-        vmem[off++] = (uint8_t)(ndef_len & 0xff);
+        vmem[off++] = (uint8_t)ndef_len;
     }
     memcpy(&vmem[off], ndef, ndef_len);
     off += ndef_len;
-    vmem[off++] = 0xfe;         // TLV terminator.
+    vmem[off] = 0xfe;  // Terminator TLV.
 
     vmem_len = total;
-    tlv_end_block = 4 + data_blocks - 1;
+    last_block = (off - 1) / BLOCK_SIZE;
     delivered = false;
     return true;
 }
 
-bool tag_emu_read(uint8_t block, uint8_t out[16]) {
+void tag_emu_read(uint8_t block, uint8_t out[READ_SIZE]) {
     size_t off = (size_t)block * BLOCK_SIZE;
-    if (off >= vmem_len) {
-        // Read past the end (reader clamped to its own memBlocks):
-        // serve zeros.
-        memset(out, 0, 16);
-        return true;
-    }
-    size_t n = vmem_len - off;
-    if (n > 16) {
-        n = 16;
+    size_t n = off < vmem_len ? vmem_len - off : 0;
+    if (n > READ_SIZE) {
+        n = READ_SIZE;
     }
     memcpy(out, &vmem[off], n);
-    if (n < 16) {
-        memset(&out[n], 0, 16 - n);
-    }
-    if (block + 3 >= tlv_end_block) {
+    memset(&out[n], 0, READ_SIZE - n);
+    // The reader fetches the CC at block 3 (which for a tiny message
+    // already shows the whole TLV) before it reads the data area, so
+    // only a data read counts.
+    if (block >= 4 && (size_t)block + READ_SIZE / BLOCK_SIZE - 1 >= last_block) {
         delivered = true;
     }
-    return true;
 }
 
-bool tag_emu_is_delivered(void) {
+bool tag_emu_delivered(void) {
     return delivered;
 }

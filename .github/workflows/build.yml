@@ -5,6 +5,12 @@ on:
   pull_request:
 
 jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: make -C test/host run
+
   firmware:
     runs-on: ubuntu-latest
     steps:

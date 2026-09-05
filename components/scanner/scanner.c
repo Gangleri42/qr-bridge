@@ -1,26 +1,34 @@
-// scanner.c -- ESP-IDF native USB host + HID host keyboard parser for NT-1228BL.
+// scanner.c -- USB HID keyboard input from a barcode scanner.
 //
-// Uses the ESP-IDF 'usb' component (native HCD + PHY setup) and the
-// 'usb_host_hid' managed component for HID class support.
+// The scanner enumerates as a boot-protocol keyboard and types each
+// decoded code followed by Enter. The ESP-IDF USB Host Library drives
+// the port and the usb_host_hid component the HID class. Reports
+// arrive on the HID driver's task and are decoded with a US keymap
+// into the pending scan; Enter hands the scan to scanner_take over a
+// length-one queue, so the newest scan always wins.
 
 #include "scanner.h"
 
-#include <stdio.h>
+#include <assert.h>
 #include <string.h>
 
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
-
-#include "usb/usb_host.h"
 #include "usb/hid_host.h"
-#include "usb/hid_usage_keyboard.h"
+#include "usb/usb_host.h"
 
 static const char *TAG = "scanner";
 
-// US keyboard layout: keycode -> ASCII (unshifted/shifted)
+// Boot-protocol keyboard report: modifiers, reserved, six keycodes.
+#define REPORT_LEN 8
+#define MOD_SHIFT (0x02 | 0x20)  // Left and right shift.
+#define KEY_ENTER 0x28
+#define KEY_BACKSPACE 0x2a
+
+// US keyboard layout: keycode -> ASCII (plain, shifted).
 static const struct {
-    uint8_t unshifted;
+    uint8_t plain;
     uint8_t shifted;
 } keymap[128] = {
     [0x04] = {'a', 'A'}, [0x05] = {'b', 'B'}, [0x06] = {'c', 'C'}, [0x07] = {'d', 'D'},
@@ -33,10 +41,8 @@ static const struct {
     [0x1e] = {'1', '!'}, [0x1f] = {'2', '@'}, [0x20] = {'3', '#'}, [0x21] = {'4', '$'},
     [0x22] = {'5', '%'}, [0x23] = {'6', '^'}, [0x24] = {'7', '&'}, [0x25] = {'8', '*'},
     [0x26] = {'9', '('}, [0x27] = {'0', ')'},
-    [0x28] = {'\n', '\n'},  // ENTER
-    [0x2a] = {'\b', '\b'},   // BACKSPACE
-    [0x2b] = {'\t', '\t'},   // TAB
-    [0x2c] = {' ', ' '},     // SPACE
+    [0x2b] = {'\t', '\t'},
+    [0x2c] = {' ', ' '},
     [0x2d] = {'-', '_'}, [0x2e] = {'=', '+'},
     [0x2f] = {'[', '{'}, [0x30] = {']', '}'},
     [0x31] = {'\\', '|'}, [0x32] = {'#', '~'},
@@ -45,146 +51,170 @@ static const struct {
     [0x37] = {'.', '>'}, [0x38] = {'/', '?'},
 };
 
-#define MAX_PAYLOAD 4096
-static uint8_t payload_buf[MAX_PAYLOAD];
-static size_t payload_len = 0;
+static QueueHandle_t scans;    // scan_t, length one: the latest scan.
+static QueueHandle_t devices;  // hid_host_device_handle_t to open.
 
-static uint8_t prev_report[8];
+// Keyboard state, touched only on the HID driver's task.
+static scan_t pending;         // Keystrokes since the last Enter.
+static bool overflow;          // The pending scan outgrew its buffer.
+static uint8_t held[6];        // Keycodes down in the previous report.
 
-static uint8_t map_keycode(uint8_t keycode, bool shift) {
-    if (keycode >= sizeof(keymap) / sizeof(keymap[0])) return 0;
-    return shift ? keymap[keycode].shifted : keymap[keycode].unshifted;
-}
-
-static void process_keypress(uint8_t keycode, uint8_t modifiers) {
-    if (keycode == 0x28) { // ENTER
-        if (payload_len > 0) {
-            if (payload_buf[payload_len - 1] == '\n') {
-                payload_len--;
-            }
-            if (payload_len > 0) {
-                ESP_LOGI(TAG, "Payload armed: %zu bytes", payload_len);
-                scanner_on_payload(payload_buf, payload_len);
-            }
+static void key_pressed(uint8_t keycode, uint8_t modifiers) {
+    if (keycode == KEY_ENTER) {
+        if (overflow) {
+            ESP_LOGW(TAG, "scan longer than %d bytes discarded", SCANNER_MAX_TEXT);
+        } else if (pending.len > 0) {
+            ESP_LOGI(TAG, "scan: %zu bytes", pending.len);
+            xQueueOverwrite(scans, &pending);
         }
-        payload_len = 0;
+        pending.len = 0;
+        overflow = false;
         return;
     }
-
-    if (keycode == 0x2a) { // BACKSPACE
-        if (payload_len > 0) payload_len--;
+    if (keycode == KEY_BACKSPACE) {
+        if (pending.len > 0) {
+            pending.len--;
+        }
         return;
     }
-
-    bool shift = (modifiers & (0x02 | 0x20)) != 0;
-    uint8_t ch = map_keycode(keycode, shift);
-
-    if (ch != 0 && ch != '\n' && payload_len < MAX_PAYLOAD - 1) {
-        payload_buf[payload_len++] = ch;
+    if (keycode >= sizeof(keymap) / sizeof(keymap[0])) {
+        return;
     }
+    uint8_t ch = (modifiers & MOD_SHIFT) ? keymap[keycode].shifted : keymap[keycode].plain;
+    if (ch == 0) {
+        return;
+    }
+    if (pending.len == SCANNER_MAX_TEXT) {
+        overflow = true;
+        return;
+    }
+    pending.text[pending.len++] = ch;
 }
 
-static bool was_pressed(uint8_t keycode) {
-    for (int i = 2; i < 8; i++) {
-        if (prev_report[i] == keycode) return true;
+static bool was_held(uint8_t keycode) {
+    for (size_t i = 0; i < sizeof(held); i++) {
+        if (held[i] == keycode) {
+            return true;
+        }
     }
     return false;
 }
 
-static void handle_keyboard_report(const uint8_t *report, size_t len) {
-    if (len < 8) return;
-    uint8_t modifiers = report[0];
-    for (int i = 2; i < 8; i++) {
-        uint8_t kc = report[i];
-        if (kc == 0) continue;
-        if (!was_pressed(kc)) {
-            process_keypress(kc, modifiers);
+// A report lists every key currently down; a key counts as pressed
+// the first report it appears in.
+static void handle_report(const uint8_t *report, size_t len) {
+    if (len < REPORT_LEN) {
+        return;
+    }
+    for (int i = 2; i < REPORT_LEN; i++) {
+        if (report[i] != 0 && !was_held(report[i])) {
+            key_pressed(report[i], report[0]);
         }
     }
-    memcpy(prev_report, report, 8);
+    memcpy(held, &report[2], sizeof(held));
 }
 
-static void hid_interface_event_cb(hid_host_device_handle_t hid_device_handle,
-                                   const hid_host_interface_event_t event,
-                                   void *arg) {
+static void reset_keyboard(void) {
+    pending.len = 0;
+    overflow = false;
+    memset(held, 0, sizeof(held));
+}
+
+static void interface_event(hid_host_device_handle_t dev,
+                            const hid_host_interface_event_t event, void *arg) {
     switch (event) {
-        case HID_HOST_INTERFACE_EVENT_INPUT_REPORT: {
-            uint8_t data[64];
-            size_t data_length = 0;
-            esp_err_t err = hid_host_device_get_raw_input_report_data(
-                hid_device_handle, data, sizeof(data), &data_length);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "report (%zu): %02x %02x %02x %02x %02x %02x %02x %02x",
-                         data_length,
-                         data_length > 0 ? data[0] : 0, data_length > 1 ? data[1] : 0,
-                         data_length > 2 ? data[2] : 0, data_length > 3 ? data[3] : 0,
-                         data_length > 4 ? data[4] : 0, data_length > 5 ? data[5] : 0,
-                         data_length > 6 ? data[6] : 0, data_length > 7 ? data[7] : 0);
-                handle_keyboard_report(data, data_length);
-            } else {
-                ESP_LOGW(TAG, "report read err: %s", esp_err_to_name(err));
-            }
-            break;
+    case HID_HOST_INTERFACE_EVENT_INPUT_REPORT: {
+        uint8_t report[64];
+        size_t len = 0;
+        if (hid_host_device_get_raw_input_report_data(dev, report, sizeof(report), &len) == ESP_OK) {
+            handle_report(report, len);
         }
-        case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "HID device disconnected");
-            payload_len = 0;
-            memset(prev_report, 0, sizeof(prev_report));
-            break;
-        case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
-            ESP_LOGW(TAG, "HID transfer error");
-            break;
-        default:
-            break;
+        break;
+    }
+    case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "scanner disconnected");
+        reset_keyboard();
+        hid_host_device_close(dev);
+        break;
+    case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
+        ESP_LOGW(TAG, "HID transfer error");
+        break;
     }
 }
 
-static void hid_driver_event_cb(hid_host_device_handle_t hid_device_handle,
-                                const hid_host_driver_event_t event,
-                                void *arg) {
-    if (event != HID_HOST_DRIVER_EVENT_CONNECTED) return;
-
-    hid_host_dev_params_t params;
-    ESP_ERROR_CHECK(hid_host_device_get_params(hid_device_handle, &params));
-    ESP_LOGI(TAG, "HID device connected: addr=%d iface=%d sub_class=%d proto=%d",
-             params.addr, params.iface_num, params.sub_class, params.proto);
-
-    hid_host_dev_info_t info;
-    if (hid_host_get_device_info(hid_device_handle, &info) == ESP_OK) {
-        ESP_LOGI(TAG, "  VID=0x%04x PID=0x%04x", info.VID, info.PID);
+static void driver_event(hid_host_device_handle_t dev,
+                         const hid_host_driver_event_t event, void *arg) {
+    if (event == HID_HOST_DRIVER_EVENT_CONNECTED) {
+        xQueueSend(devices, &dev, 0);
     }
+}
 
-    const hid_host_device_config_t dev_config = {
-        .callback = hid_interface_event_cb,
-        .callback_arg = NULL,
-    };
-    ESP_ERROR_CHECK(hid_host_device_open(hid_device_handle, &dev_config));
+// Opens each keyboard the driver reports. Runs on its own task because
+// the class requests wait on transfers that the driver's task
+// completes, so they cannot be issued from its callback.
+static void open_task(void *arg) {
+    for (;;) {
+        hid_host_device_handle_t dev;
+        xQueueReceive(devices, &dev, portMAX_DELAY);
 
-    // device_open leaves the interface in READY state with no transfers
-    // submitted; start() begins the interrupt-IN pipe.
-    ESP_ERROR_CHECK(hid_host_device_start(hid_device_handle));
-    ESP_LOGI(TAG, "HID device opened, listening for keystrokes");
+        hid_host_dev_params_t params;
+        if (hid_host_device_get_params(dev, &params) != ESP_OK) {
+            continue;
+        }
+        if (params.sub_class != HID_SUBCLASS_BOOT_INTERFACE ||
+            params.proto != HID_PROTOCOL_KEYBOARD) {
+            ESP_LOGW(TAG, "ignoring HID interface %u: subclass %u protocol %u is not a boot keyboard",
+                     params.iface_num, params.sub_class, params.proto);
+            continue;
+        }
+
+        const hid_host_device_config_t config = {
+            .callback = interface_event,
+            .callback_arg = NULL,
+        };
+        esp_err_t err = hid_host_device_open(dev, &config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "cannot open the keyboard: %s", esp_err_to_name(err));
+            continue;
+        }
+        // Boot protocol gives the fixed 8-byte report decoded above;
+        // idle 0 makes the device report on change only. A device that
+        // refuses either keeps its power-on defaults.
+        err = hid_class_request_set_protocol(dev, HID_REPORT_PROTOCOL_BOOT);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Set_Protocol refused: %s", esp_err_to_name(err));
+        }
+        err = hid_class_request_set_idle(dev, 0, 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Set_Idle refused: %s", esp_err_to_name(err));
+        }
+        err = hid_host_device_start(dev);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "cannot start the keyboard: %s", esp_err_to_name(err));
+            hid_host_device_close(dev);
+            continue;
+        }
+        hid_host_dev_info_t info;
+        if (hid_host_get_device_info(dev, &info) == ESP_OK) {
+            ESP_LOGI(TAG, "scanner connected: VID %04x PID %04x", info.VID, info.PID);
+        }
+    }
 }
 
 static void usb_host_lib_task(void *arg) {
-    while (1) {
-        uint32_t event_flags;
-        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+    for (;;) {
+        uint32_t flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
             usb_host_device_free_all();
-        }
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
-            ESP_LOGI(TAG, "USB: all devices freed");
         }
     }
 }
 
 void scanner_init(void) {
-    ESP_LOGI(TAG, "Initializing USB host");
-
-    // Verbose HID/USB logging while debugging enumeration issues
-    esp_log_level_set("hid_host", ESP_LOG_DEBUG);
-    esp_log_level_set("usb", ESP_LOG_DEBUG);
+    scans = xQueueCreate(1, sizeof(scan_t));
+    devices = xQueueCreate(4, sizeof(hid_host_device_handle_t));
+    assert(scans != NULL && devices != NULL);
 
     // peripheral_map BIT0 is USB controller 0: on the ESP32-P4 that is
     // the OTG 2.0 (high-speed) core the MX1.25 header is wired to, and
@@ -202,17 +232,15 @@ void scanner_init(void) {
         .task_priority = 5,
         .stack_size = 4096,
         .core_id = 0,
-        .callback = hid_driver_event_cb,
+        .callback = driver_event,
         .callback_arg = NULL,
     };
     ESP_ERROR_CHECK(hid_host_install(&hid_config));
 
-    xTaskCreate(usb_host_lib_task, "usb_host_lib", 4096, NULL, 10, NULL);
-
-    ESP_LOGI(TAG, "Scanner init done");
+    xTaskCreate(usb_host_lib_task, "usb_host", 4096, NULL, 10, NULL);
+    xTaskCreate(open_task, "hid_open", 4096, NULL, 5, NULL);
 }
 
-void scanner_clear_payload(void) {
-    payload_len = 0;
-    memset(prev_report, 0, sizeof(prev_report));
+bool scanner_take(scan_t *out, TickType_t ticks) {
+    return xQueueReceive(scans, out, ticks) == pdTRUE;
 }

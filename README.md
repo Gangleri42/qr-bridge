@@ -49,8 +49,8 @@ older kernels).
 
 1. Boot: the USB host stack comes up and the PN532 answers
    GetFirmwareVersion and SAMConfiguration. If the PN532 is silent the
-   NFC task exits and the console says so; the board has no other way
-   to show it.
+   console says so and the bridge keeps trying once a second; the
+   board has no other way to show it.
 2. Scan: the scanner types the QR content as keystrokes and finishes
    with Enter. The scanner's own beep is the "armed" signal. Scanning
    again replaces the payload.
@@ -65,16 +65,27 @@ Limits:
 - 977 bytes of scanned text. The virtual tag is 252 blocks, a little
   above an NTAG216, and a long multisig descriptor fits.
 - Keyboard-mode scanners carry printable ASCII only, and the keymap is
-  the US layout.
+  the US layout. Scans over 4096 characters are discarded whole.
 - The payload is one text record. The SeedHammer decides what it is:
   seed words, a descriptor, codex32, nip19, or a plain text plate.
 
 ## Console
 
-UART0 is a debug port. At the current log level it echoes every HID
-report, which is every keystroke of the scanned code. Keep it
-unattached while scanning secrets. Turning that down is on the review
-list before the first release.
+UART0 logs state changes and byte counts: scanner connected, scan of N
+bytes, armed, reader activated, delivered. The scanned text itself is
+never logged.
+
+## Tests
+
+The two pure components, the Text record and the virtual tag, build on
+the host with the checks that pin their byte layouts:
+
+```sh
+make -C test/host run
+```
+
+CI runs them alongside the firmware build. Everything else needs the
+hardware.
 
 ## Layout
 
@@ -84,6 +95,7 @@ list before the first release.
 - `components/pn532/` PN532 HSU driver, target mode only.
 - `components/tag_emu/` the virtual Type 2 tag: CC, NDEF TLV, block reads.
 - `components/text_record/` one NDEF Text record.
+- `test/host/` host build and tests for the two components above.
 
 ## License
 

@@ -8,8 +8,12 @@
 extern "C" {
 #endif
 
-// Build a single-Text-record NDEF message for `payload`. Returns the
-// message length written to `out`, or 0 if it does not fit.
+// Bytes the record adds to its payload: 7 up to 252 payload bytes, 10
+// above.
+#define TEXT_RECORD_OVERHEAD 10
+
+// Build a single-Text-record NDEF message for payload into out.
+// Returns the message length, or 0 if it does not fit out_max.
 size_t text_record_build(const uint8_t *payload, size_t payload_len,
                          uint8_t *out, size_t out_max);
 
