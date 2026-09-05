@@ -67,7 +67,8 @@ Limits:
 - Keyboard-mode scanners carry printable ASCII only, and the keymap is
   the US layout. Scans over 4096 characters are discarded whole.
 - The payload is one text record. The SeedHammer decides what it is:
-  seed words, a descriptor, codex32, nip19, or a plain text plate.
+  seed words, a SeedQR in its digit form, a descriptor, codex32, nip19,
+  or a plain text plate.
 
 ## Console
 
