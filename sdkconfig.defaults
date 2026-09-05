@@ -1,26 +1,15 @@
-# qr-bridge on the Waveshare ESP32-P4-Pico
-# Target: ESP32-P4 (RISC-V dual-core, no WiFi/BLE)
+# qr-bridge on the Waveshare ESP32-P4-Pico. Only what differs from the
+# ESP-IDF defaults. The console is UART0 at 115200 (the CH343P on the
+# USB-C connector), which is the default.
 
 CONFIG_IDF_TARGET="esp32p4"
-CONFIG_IDF_TARGET_ESP32P4=y
 
-# Flash & PSRAM
+# The module's flash part.
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
-CONFIG_SPIRAM=y
 
-# UART0 Console (CH343P on GPIO37/38)
-CONFIG_ESP_CONSOLE_UART_NUM=0
-CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
-
-# UART for PN532
-CONFIG_UART_ISR_IN_IRAM=n
-
-# FreeRTOS
+# The PN532 driver waits in 1 to 3 ms steps.
 CONFIG_FREERTOS_HZ=1000
 
-# Logging
-CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
-
-# Partition table
-CONFIG_PARTITION_TABLE_TWO_OTA=y
+# The same commit gives the same binary: no compile date or time, no
+# build paths in the ELF.
+CONFIG_APP_REPRODUCIBLE_BUILD=y

@@ -13,9 +13,9 @@ screen, no storage, no radio silicon.
 
 | Part | Role |
 | --- | --- |
-| Waveshare ESP32-P4-Pico | MCU. USB host on the MX1.25 header, UART console on the USB-C connector, no radio on the die. |
-| NT-1228BL 2D barcode scanner | Any scanner that enumerates as a USB HID keyboard and sends Enter after the code will do. Plugs into the MX1.25 USB OTG header. |
-| PN532 breakout | Mode switches set to HSU. Wired to UART1. |
+| Waveshare ESP32-P4-Pico | MCU. USB host on the MX1.25 header, UART console on the USB-C connector, no radio on the die. | 11$
+| 2D barcode scanner | Any scanner that enumerates as a USB HID keyboard and sends Enter after the code will do. Plugs into the MX1.25 USB OTG header. | 15$
+| PN532 breakout | Mode switches set to HSU. Wired to UART1. | 2$
 
 PN532 wiring, from `components/board/board.h`:
 
@@ -23,7 +23,6 @@ PN532 wiring, from `components/board/board.h`:
 | --- | --- |
 | TXD | GPIO18 |
 | RXD | GPIO17 |
-| RSTPDN | GPIO19, configured as a pulled-up input and never driven |
 | VCC, GND | 3V3, GND |
 
 Power the board over USB-C. The same connector carries the console at
@@ -45,12 +44,13 @@ idf.py -p /dev/ttyACM0 flash monitor
 The port is the CH343P behind the USB-C connector (`/dev/ttyUSB0` on
 older kernels).
 
+The build is reproducible: the same commit on the same ESP-IDF release
+gives a byte-identical `qr-bridge.bin`, with no compile date and no
+build paths inside.
+
 ## What it does
 
-1. Boot: the USB host stack comes up and the PN532 answers
-   GetFirmwareVersion and SAMConfiguration. If the PN532 is silent the
-   console says so and the bridge keeps trying once a second; the
-   board has no other way to show it.
+1. Boot: power the bridge via USB-C
 2. Scan: the scanner types the QR content as keystrokes and finishes
    with Enter. The scanner's own beep is the "armed" signal. Scanning
    again replaces the payload.

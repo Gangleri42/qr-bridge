@@ -3,3 +3,9 @@ managed_components/
 sdkconfig
 sdkconfig.old
 test/host/tests
+
+# Key material never belongs in the tree, should the device ever get
+# secure boot or flash encryption.
+*.pem
+*.key
+flash_encryption_key*
