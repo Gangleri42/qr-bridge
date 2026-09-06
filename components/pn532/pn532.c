@@ -75,10 +75,12 @@ static bool rx(uint8_t *buf, size_t len, uint32_t timeout_ms) {
 // Read one response frame into buf. Returns the body length without
 // the TFI, PN532_TIMEOUT if no frame began within timeout_ms (nothing
 // consumed, so the wait can go on), or PN532_ERROR for a malformed
-// frame. The whole frame is consumed even when it exceeds max, or the
-// leftover bytes would corrupt the next read. Stray ACK frames (the
-// chip can emit a second one after a wake during a target session)
-// are skipped.
+// frame or the chip's own error frame. A frame that began is consumed
+// whole, even one that exceeds max or is rejected, or the leftover
+// bytes would corrupt the next read. Stray ACK frames (the chip can
+// emit a second one after a wake during a target session) are skipped;
+// they carry LEN/LCS 00 FF, which no other frame does, and are told
+// apart before the checksum rule they do not follow.
 static int read_response(uint8_t *buf, size_t max, uint32_t timeout_ms) {
     uint8_t hdr[5];
     for (;;) {
@@ -92,30 +94,31 @@ static int read_response(uint8_t *buf, size_t max, uint32_t timeout_ms) {
             ESP_LOGD(TAG, "bad preamble %02x %02x %02x", hdr[0], hdr[1], hdr[2]);
             return PN532_ERROR;
         }
-        if ((uint8_t)(hdr[3] + hdr[4]) != 0) {
-            ESP_LOGD(TAG, "bad LEN/LCS %02x %02x", hdr[3], hdr[4]);
-            return PN532_ERROR;
-        }
-        if (hdr[3] != 0) {
+        if (hdr[3] != ack_frame[3] || hdr[4] != ack_frame[4]) {
             break;
         }
         uint8_t post;  // An ACK: consume its postamble and read on.
         if (!rx(&post, 1, FRAME_MS) || post != POSTAMBLE) {
             return PN532_ERROR;
         }
+        ESP_LOGD(TAG, "stray ACK skipped");
+    }
+    if (hdr[3] == 0 || (uint8_t)(hdr[3] + hdr[4]) != 0) {
+        ESP_LOGD(TAG, "bad LEN/LCS %02x %02x", hdr[3], hdr[4]);
+        return PN532_ERROR;
     }
     size_t body_len = hdr[3] - 1;
-    uint8_t tfi;
-    if (!rx(&tfi, 1, FRAME_MS) || tfi != PN532_TO_HOST) {
-        return PN532_ERROR;
-    }
-    uint8_t scratch[MAX_BODY];
     size_t copy = body_len < max ? body_len : max;
-    if (!rx(buf, copy, FRAME_MS) || !rx(scratch, body_len - copy, FRAME_MS)) {
+    uint8_t scratch[MAX_BODY];
+    uint8_t tfi, dcs, post;
+    if (!rx(&tfi, 1, FRAME_MS) || !rx(buf, copy, FRAME_MS) ||
+        !rx(scratch, body_len - copy, FRAME_MS) || !rx(&dcs, 1, FRAME_MS) ||
+        !rx(&post, 1, FRAME_MS)) {
         return PN532_ERROR;
     }
-    uint8_t dcs;
-    if (!rx(&dcs, 1, FRAME_MS)) {
+    if (tfi != PN532_TO_HOST) {
+        // 0x7f is the chip's error frame: it rejected the command.
+        ESP_LOGD(TAG, "no response, TFI %02x", tfi);
         return PN532_ERROR;
     }
     uint8_t sum = tfi;
@@ -125,12 +128,8 @@ static int read_response(uint8_t *buf, size_t max, uint32_t timeout_ms) {
     for (size_t i = 0; i < body_len - copy; i++) {
         sum += scratch[i];
     }
-    if ((uint8_t)(sum + dcs) != 0) {
-        ESP_LOGD(TAG, "bad checksum");
-        return PN532_ERROR;
-    }
-    uint8_t post;
-    if (!rx(&post, 1, FRAME_MS) || post != POSTAMBLE) {
+    if ((uint8_t)(sum + dcs) != 0 || post != POSTAMBLE) {
+        ESP_LOGD(TAG, "bad checksum or postamble");
         return PN532_ERROR;
     }
     return (int)body_len;
@@ -145,6 +144,11 @@ static void send_wake(void) {
 
 static void flush_rx(void) {
     uart_flush_input(PN532_UART_PORT);
+}
+
+bool pn532_rx_pending(void) {
+    size_t n = 0;
+    return uart_get_buffered_data_len(PN532_UART_PORT, &n) == ESP_OK && n > 0;
 }
 
 void pn532_abort(void) {
@@ -204,9 +208,9 @@ static bool send(const uint8_t *body, size_t body_len, bool wake, uint32_t timeo
 }
 
 // Read the response to the command last sent: its body without the
-// echoed command code (0x7F for errors). Up to max bytes are copied
-// to response; the return value is the full length, or PN532_TIMEOUT
-// or PN532_ERROR.
+// echoed command code. Up to max bytes are copied to response; the
+// return value is the full length, or PN532_TIMEOUT or PN532_ERROR,
+// which is also what the chip's own error frame becomes.
 static int receive(uint8_t *response, size_t max, uint32_t timeout_ms) {
     uint8_t staged[MAX_BODY];
     int n = read_response(staged, sizeof(staged), timeout_ms);
@@ -224,14 +228,15 @@ static int receive(uint8_t *response, size_t max, uint32_t timeout_ms) {
 }
 
 // Send a command and return its response, as send and receive do. A
-// timeout aborts the command, so the chip is idle for the next one.
+// timeout or a malformed answer aborts the command, since the chip may
+// still be running it, so it is idle for the next one.
 static int command(const uint8_t *body, size_t body_len, bool wake,
                    uint8_t *response, size_t max, uint32_t timeout_ms) {
     if (!send(body, body_len, wake, timeout_ms)) {
         return PN532_ERROR;
     }
     int n = receive(response, max, timeout_ms);
-    if (n == PN532_TIMEOUT) {
+    if (n < 0) {
         pn532_abort();
     }
     return n;
@@ -286,6 +291,20 @@ bool pn532_start(void) {
     return command(sam, sizeof(sam), true, NULL, 0, 500) >= 0;
 }
 
+// Copy the initiator's command out of a target-mode response of n
+// bytes, of which at most rsp_max landed in rsp: everything after the
+// leading status or mode byte. Returns its length, or PN532_ERROR when
+// it does not fit max.
+static int take_command(const uint8_t *rsp, size_t rsp_max, int n, uint8_t *cmd, size_t max) {
+    size_t got = (size_t)n < rsp_max ? (size_t)n : rsp_max;
+    size_t len = got - 1;
+    if (len > max) {
+        return PN532_ERROR;
+    }
+    memcpy(cmd, &rsp[1], len);
+    return (int)len;
+}
+
 bool pn532_tg_listen(const uint8_t *nfca, const uint8_t *nfcid3t) {
     // Mode 0x01: passive Type A card only. Body layout: cmd + mode +
     // MIFARE params(6) + FeliCa params(18) + NFCID3t(10) + general-bytes
@@ -307,13 +326,7 @@ int pn532_tg_wait_initiator(uint8_t *first_cmd, size_t max, uint32_t timeout_ms)
         return PN532_ERROR;
     }
     // rsp[0] is the mode byte; the initiator's first command follows.
-    size_t got = (size_t)n < sizeof(rsp) ? (size_t)n : sizeof(rsp);
-    size_t cmd = got - 1;
-    if (cmd > max) {
-        cmd = max;
-    }
-    memcpy(first_cmd, &rsp[1], cmd);
-    return (int)cmd;
+    return take_command(rsp, sizeof(rsp), n, first_cmd, max);
 }
 
 int pn532_tg_get_command(uint8_t *cmd, size_t max, uint32_t timeout_ms) {
@@ -324,13 +337,7 @@ int pn532_tg_get_command(uint8_t *cmd, size_t max, uint32_t timeout_ms) {
         ESP_LOGD(TAG, "TgGetInitiatorCommand: status %02x, n=%d", n >= 1 ? rsp[0] : 0xff, n);
         return PN532_ERROR;
     }
-    size_t got = (size_t)n < sizeof(rsp) ? (size_t)n : sizeof(rsp);
-    size_t len = got - 1;
-    if (len > max) {
-        return PN532_ERROR;
-    }
-    memcpy(cmd, &rsp[1], len);
-    return (int)len;
+    return take_command(rsp, sizeof(rsp), n, cmd, max);
 }
 
 int pn532_tg_respond(const uint8_t *data, size_t len, uint32_t timeout_ms) {

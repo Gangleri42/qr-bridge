@@ -7,6 +7,8 @@
 #ifndef QR_BRIDGE_BOARD_H
 #define QR_BRIDGE_BOARD_H
 
+#include "driver/uart.h"
+
 // PN532 breakout in HSU (UART) mode on UART1, via the 2x20 header.
 #define PN532_UART_PORT       UART_NUM_1
 #define PN532_UART_BAUD       115200

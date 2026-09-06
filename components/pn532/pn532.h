@@ -51,6 +51,11 @@ int pn532_tg_respond(const uint8_t *data, size_t len, uint32_t timeout_ms);
 // next one.
 void pn532_abort(void);
 
+// Whether bytes from the chip are waiting to be read: after a wait
+// that ended empty, a response has just begun and the next wait will
+// read it.
+bool pn532_rx_pending(void);
+
 #ifdef __cplusplus
 }
 #endif
