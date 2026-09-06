@@ -210,9 +210,13 @@ static void test_bbqr_series_vector(void) {
     static char want[4096];
     size_t n = read_file("testdata/series-in.txt", in, sizeof(in));
     size_t wn = read_file("testdata/series-v17.txt", (uint8_t *)want, sizeof(want));
-    CHECK(n == 1501 && wn > 0, "test data present: %zu input bytes, %zu expected", n, wn);
+    CHECK(n == 1501 && wn > 0, "test data present (run from test/host): %zu input bytes, %zu expected",
+          n, wn);
+    if (n != 1501 || wn == 0) {
+        return;
+    }
     size_t len = bbqr_base32(in, n, encoded);
-    bbqr_series_t s;
+    bbqr_series_t s = {0};
     CHECK(bbqr_split(&s, encoded, len, 'U', 938) && s.parts == 3, "split at 938 gives three parts");
     char part[938];
     size_t off = 0;
