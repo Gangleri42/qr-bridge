@@ -64,7 +64,7 @@ build paths inside.
 4. A long scan is a series. As soon as the SeedHammer has read one
    part the bridge presents the next, round-robin, and the SeedHammer
    counts PART n OF m on its screen; keep holding until the preview
-   appears, a second or two per part. The series is cleared once every
+   appears, about two seconds per part. The series is cleared once every
    part has been read and the reader has stayed away for 3 s. Pulled
    away early, the bridge keeps the series armed and the next tap
    resumes it.
@@ -74,7 +74,7 @@ Limits:
 - 977 bytes of scanned text per tag. The virtual tag is 252 blocks, a
   little above an NTAG216, and the SeedHammer's reader addresses no
   more. Longer scans go as BBQr parts of 605 bytes each: a 2.8 KB
-  descriptor takes five tags, a second or two each under the reader.
+  descriptor takes five tags and about eight seconds under the reader.
   The SeedHammer joins series of up to 16 KB.
 - Keyboard-mode scanners carry printable ASCII only, and the keymap is
   the US layout. Scans over 8192 characters are discarded whole; the
