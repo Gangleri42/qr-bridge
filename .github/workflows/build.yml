@@ -8,19 +8,19 @@ jobs:
   host-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - run: make -C test/host run
 
   firmware:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: espressif/esp-idf-ci-action@v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
         with:
           esp_idf_version: v5.4.4
           target: esp32p4
           command: idf.py build
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: qr-bridge-${{ github.sha }}
           path: |
